@@ -44,6 +44,5 @@ namespace DarkAges {
             void ToggleWalk();
             void PrintMenu() const;
         };
-
     }
 }
