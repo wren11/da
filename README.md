@@ -129,5 +129,5 @@
      buffer is 4MB (1024 slots × 4096 bytes), allocated once and reused forever.
   
   This architecture provides the reliability of synchronous I/O with the performance
-  of asynchronous processing, eliminating the classic producer-consumer pattern and the race condition entirely often found in other solutions like mutexes or critical sections or other synchronization mechanisms.
+  of asynchronous processing, eliminating the classic producer-consumer pattern.
 ```
