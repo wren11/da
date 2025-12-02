@@ -180,6 +180,7 @@
     <ClCompile Include="Memory\MemoryManager.cpp" />
     <ClCompile Include="Memory\Process.cpp" />
     <ClCompile Include="Operations\WalkOperation.cpp" />
+    <ClCompile Include="Operations\FollowOperation.cpp" />
     <ClCompile Include="Operations\LoginOperation.cpp" />
     <ClCompile Include="Operations\PacketOperation.cpp" />
     <ClCompile Include="Config\Configuration.cpp" />
@@ -196,6 +197,7 @@
     <ClInclude Include="Operations\GameAddresses.h" />
     <ClInclude Include="Operations\IOperation.h" />
     <ClInclude Include="Operations\WalkOperation.h" />
+    <ClInclude Include="Operations\FollowOperation.h" />
     <ClInclude Include="Operations\LoginOperation.h" />
     <ClInclude Include="Operations\PacketOperation.h" />
     <ClInclude Include="Config\Configuration.h" />
