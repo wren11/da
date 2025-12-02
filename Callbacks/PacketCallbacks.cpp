@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "Callbacks/PacketCallbacks.h"
+#include "Operations/ParseWorldUserListOperation.h"
+#include "Memory/MemoryManager.h"
 
 static PacketCallbackContext g_callback_ctx = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 
@@ -54,6 +56,22 @@ void HandleRecvPacket(const BYTE* pkt, DWORD len) {
     }
     if (g_callback_ctx.recv_buffer && g_callback_ctx.recv_buffer_write) {
         g_callback_ctx.recv_buffer_write(g_callback_ctx.recv_buffer, pkt, len);
+    }
+
+    if (len >= 5 && pkt[0] == 0x36) {
+        DarkAges::Memory::MemoryManager mm(GetCurrentProcess());
+        DarkAges::Operations::ParseWorldUserListOperation op(mm, (uintptr_t)pkt);
+
+        if (op.Execute()) {
+            printf("[IN ] WORLD_LIST: WorldCount=%u, UserCount=%u\n", op.GetWorldCount(), op.GetUserCount());
+            const auto& users = op.GetUsers();
+            for (const auto& user : users) {
+                printf("[IN ]   User: %s (Title: %s, Class: %d, Color: %d, Status: %d)\n",
+                    user.name.c_str(), user.title.c_str(), user.characterClass, user.color, user.status);
+            }
+        } else {
+            printf("[IN ] WORLD_LIST: Failed to parse packet\n");
+        }
     }
 }
 

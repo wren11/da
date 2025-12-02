@@ -1,5 +1,5 @@
 #pragma once
-#include "Operations/IOperation.h"
+#include "Operations/OperationBase.h"
 #include "Operations/GameAddresses.h"
 
 namespace DarkAges {

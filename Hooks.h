@@ -113,29 +113,218 @@ protected:
     HANDLE h_proc_;
     LPVOID target_func_;
     LPVOID trampoline_;
+    LPVOID helper_addr_;
     std::vector<BYTE> orig_bytes_;
     bool is_installed_;
+    bool has_original_bytes_;
 
 public:
     FunctionHook(HANDLE h_proc, LPVOID target) :
-        h_proc_(h_proc), target_func_(target), trampoline_(nullptr), is_installed_(false) {}
+        h_proc_(h_proc), target_func_(target), trampoline_(nullptr), helper_addr_(nullptr), is_installed_(false), has_original_bytes_(false) {}
 
-    virtual ~FunctionHook() { if (is_installed_) Uninstall(); }
+    virtual ~FunctionHook() { ForceUninstall(); }
     virtual bool Install() = 0;
     virtual bool Uninstall() { return false; }
     bool IsInstalled() const { return is_installed_; }
 
 protected:
-    bool Backup(size_t size) {
-        orig_bytes_.resize(size);
+    // Check if a hook is already installed at the target address
+    bool IsHookPresent(size_t hook_size) {
+        std::vector<BYTE> current_bytes(hook_size);
         SIZE_T read;
-        return ReadProcessMemory(h_proc_, target_func_, orig_bytes_.data(), size, &read) && read == size;
+        if (!ReadProcessMemory(h_proc_, target_func_, current_bytes.data(), hook_size, &read) || read != hook_size) {
+            return false;
+        }
+        // Check for jump instruction (0xE9) - our hook signature
+        return current_bytes[0] == 0xE9;
     }
 
+    // Backup original bytes, but only if not already backed up or if hook is present
+    bool Backup(size_t size) {
+        // If we already have original bytes and no hook is present, we're good
+        if (has_original_bytes_ && !IsHookPresent(size)) {
+            return true;
+        }
+
+        // If hook is present, CleanupExistingHook should have been called first
+        // But if we're here, try to recover bytes (CleanupExistingHook will handle freeing allocations)
+        if (IsHookPresent(size)) {
+            // Read the hook to find the trampoline address
+            std::vector<BYTE> hook_bytes(6);
+            SIZE_T read;
+            if (!ReadProcessMemory(h_proc_, target_func_, hook_bytes.data(), 6, &read) || read != 6) {
+                return false;
+            }
+            
+            if (hook_bytes[0] == 0xE9) {
+                // Calculate trampoline address from relative jump
+                DWORD jmp_offset = *(DWORD*)(hook_bytes.data() + 1);
+                LPVOID trampoline_addr = (LPVOID)((DWORD)target_func_ + 5 + jmp_offset);
+                
+                // Read original bytes from trampoline (they're at the start)
+                orig_bytes_.resize(size);
+                if (!ReadProcessMemory(h_proc_, trampoline_addr, orig_bytes_.data(), size, &read) || read != size) {
+                    orig_bytes_.clear();
+                    return false;
+                }
+                
+                // Verify these look like original bytes (not hook bytes)
+                if (orig_bytes_[0] == 0xE9) {
+                    orig_bytes_.clear();
+                    return false;
+                }
+                
+                has_original_bytes_ = true;
+                return true;
+            }
+            return false;
+        }
+
+        // No hook present, read original bytes directly
+        orig_bytes_.resize(size);
+        SIZE_T read;
+        if (!ReadProcessMemory(h_proc_, target_func_, orig_bytes_.data(), size, &read) || read != size) {
+            return false;
+        }
+
+        // Verify we didn't read hook bytes
+        if (orig_bytes_[0] == 0xE9) {
+            orig_bytes_.clear();
+            return false;
+        }
+
+        has_original_bytes_ = true;
+        return true;
+    }
+
+    // Restore original bytes with proper page protection
     bool Restore() {
-        if (orig_bytes_.empty()) return false;
+        if (!has_original_bytes_ || orig_bytes_.empty()) {
+            return false;
+        }
+
+        DWORD old_protect;
+        if (!VirtualProtectEx(h_proc_, target_func_, orig_bytes_.size(), PAGE_EXECUTE_READWRITE, &old_protect)) {
+            return false;
+        }
+
         SIZE_T written;
-        return WriteProcessMemory(h_proc_, target_func_, orig_bytes_.data(), orig_bytes_.size(), &written) && written == orig_bytes_.size();
+        bool success = WriteProcessMemory(h_proc_, target_func_, orig_bytes_.data(), orig_bytes_.size(), &written) && written == orig_bytes_.size();
+        
+        DWORD temp;
+        VirtualProtectEx(h_proc_, target_func_, orig_bytes_.size(), old_protect, &temp);
+        
+        if (!success) {
+            return false;
+        }
+
+        // Flush instruction cache
+        FlushInstructionCache(h_proc_, target_func_, orig_bytes_.size());
+        return true;
+    }
+
+    // Force restore even if is_installed_ is false (for cleanup on restart)
+    bool ForceRestore() {
+        if (!has_original_bytes_ || orig_bytes_.empty()) {
+            // If hook is present but we don't have original bytes, we can't restore
+            // This means a previous installation wasn't cleaned up properly
+            return false;
+        }
+        return Restore();
+    }
+
+    // Clean up any existing hook and its allocations (from previous runs)
+    bool CleanupExistingHook(size_t hook_size) {
+        if (!IsHookPresent(hook_size)) {
+            return true; // No hook present, nothing to clean
+        }
+
+        // Read the hook to find the trampoline address
+        std::vector<BYTE> hook_bytes(6);
+        SIZE_T read;
+        if (!ReadProcessMemory(h_proc_, target_func_, hook_bytes.data(), 6, &read) || read != 6) {
+            return false;
+        }
+        
+        if (hook_bytes[0] != 0xE9) {
+            return false; // Not our hook format
+        }
+
+        // Calculate trampoline address from relative jump
+        DWORD jmp_offset = *(DWORD*)(hook_bytes.data() + 1);
+        LPVOID old_trampoline = (LPVOID)((DWORD)target_func_ + 5 + jmp_offset);
+        
+        // Read original bytes from trampoline (they're at the start)
+        std::vector<BYTE> recovered_bytes(hook_size);
+        if (ReadProcessMemory(h_proc_, old_trampoline, recovered_bytes.data(), hook_size, &read) && read == hook_size) {
+            // Verify these look like original bytes (not hook bytes)
+            if (recovered_bytes[0] != 0xE9) {
+                orig_bytes_ = recovered_bytes;
+                has_original_bytes_ = true;
+            }
+        }
+
+        // Read trampoline to find helper code address
+        // The trampoline has: [ORIG_BYTES][TRAMP_TEMPLATE]
+        // In tramp_tmpl, offset 13 has the call instruction (0xE8), offset 14-17 has relative offset
+        std::vector<BYTE> tramp_sample(256);
+        if (ReadProcessMemory(h_proc_, old_trampoline, tramp_sample.data(), 256, &read) && read >= hook_size + 20) {
+            size_t tramp_start = hook_size;
+            // Check for call instruction (0xE8) at expected location
+            if (tramp_start + 17 < tramp_sample.size() && tramp_sample[tramp_start + 13] == 0xE8) {
+                // Calculate helper code address from relative call
+                // call instruction format: 0xE8 [4-byte relative offset]
+                // Target = call_address + 5 + relative_offset
+                DWORD call_offset = *(DWORD*)(tramp_sample.data() + tramp_start + 14);
+                DWORD call_from = (DWORD)old_trampoline + tramp_start + 13;
+                LPVOID old_helper = (LPVOID)(call_from + 5 + call_offset);
+                
+                // Verify the helper code looks valid (starts with expected prologue)
+                std::vector<BYTE> helper_check(3);
+                SIZE_T helper_read;
+                if (ReadProcessMemory(h_proc_, old_helper, helper_check.data(), 3, &helper_read) && 
+                    helper_read == 3 && 
+                    helper_check[0] == 0x55 && helper_check[1] == 0x8B && helper_check[2] == 0xEC) {
+                    // This looks like our helper code, free it
+                    VirtualFreeEx(h_proc_, old_helper, 0, MEM_RELEASE);
+                }
+            }
+        }
+
+        // Free the old trampoline
+        VirtualFreeEx(h_proc_, old_trampoline, 0, MEM_RELEASE);
+
+        // Restore original bytes if we recovered them
+        if (has_original_bytes_) {
+            Restore();
+            Sleep(10); // Small delay to ensure restoration completes
+        }
+
+        return true;
+    }
+
+    // Force uninstall - always restore, even if is_installed_ is false
+    bool ForceUninstall() {
+        // First, clean up any existing hooks from previous runs
+        CleanupExistingHook(6);
+
+        // Free our allocated memory
+        if (trampoline_) {
+            VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+            trampoline_ = nullptr;
+        }
+        if (helper_addr_) {
+            VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+            helper_addr_ = nullptr;
+        }
+        
+        // Always try to restore original bytes if we have them
+        if (has_original_bytes_) {
+            Restore();
+        }
+        
+        is_installed_ = false;
+        return true;
     }
 };
 
@@ -162,12 +351,10 @@ private:
         0x61,                                           // popad
         0xE9, 0x00, 0x00, 0x00, 0x00                    // jmp ORIG+LEN
     };
-    
-    LPVOID helper_addr_;
 
 public:
     SendFunctionHook(HANDLE h_proc, LPVOID func, RemoteRingBuffer* rb) :
-        FunctionHook(h_proc, func), rb_(rb), helper_addr_(nullptr) {}
+        FunctionHook(h_proc, func), rb_(rb) {}
 
     bool Install() override;
     bool Uninstall() override;
@@ -197,11 +384,9 @@ private:
         0xE9, 0x00, 0x00, 0x00, 0x00                    // jmp ORIG+LEN
     };
 
-    LPVOID helper_addr_;
-
 public:
     RecvFunctionHook(HANDLE h_proc, LPVOID func, RemoteRingBuffer* rb) :
-        FunctionHook(h_proc, func), rb_(rb), helper_addr_(nullptr) {}
+        FunctionHook(h_proc, func), rb_(rb) {}
 
     bool Install() override;
     bool Uninstall() override;

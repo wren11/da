@@ -168,6 +168,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Operations\AddCustomUserToListOperation.cpp" />
+    <ClCompile Include="Operations\ParseWorldUserListOperation.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
@@ -187,6 +189,9 @@
     <ClCompile Include="Bot\GameBot.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Operations\AddCustomUserToListOperation.h" />
+    <ClInclude Include="Operations\OperationBase.h" />
+    <ClInclude Include="Operations\ParseWorldUserListOperation.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Hooks.h" />
     <ClInclude Include="Callbacks\PacketCallbacks.h" />

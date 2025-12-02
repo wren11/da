@@ -93,27 +93,46 @@ static const BYTE tramp_tmpl[] = {
 // [ 0x02 ] SEND HOOK IMPLEMENTATION
 // =========================================================================================
 bool SendFunctionHook::Install() {
-    if (is_installed_) return true;
+    // Always uninstall first to restore original bytes and clean up any existing hooks
+    ForceUninstall();
+    
+    // Clean up any existing hooks from previous runs (this will free old allocations)
+    CleanupExistingHook(6);
 
     LOG("INSTALLING_SEND_HOOK: 0x" << std::hex << (DWORD)target_func_);
 
-    BYTE byte;
-    if (!ReadProcessMemory(h_proc_, target_func_, &byte, 1, nullptr)) return false;
-    if (byte == 0xE9 || byte == 0xE8) {
-        LOG("TARGET_ALREADY_HOOKED");
+    const size_t STOLEN_SIZE = 6;
+    
+    // Backup original bytes (will detect and restore existing hooks if present)
+    if (!Backup(STOLEN_SIZE)) {
+        LOG("FAILED_TO_BACKUP_ORIGINAL_BYTES");
         return false;
     }
 
-    const size_t STOLEN_SIZE = 6;
-    if (!Backup(STOLEN_SIZE)) return false;
-
+    // Allocate helper code
     helper_addr_ = VirtualAllocEx(h_proc_, nullptr, sizeof(helper_code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!helper_addr_) return false;
-    WriteProcessMemory(h_proc_, helper_addr_, helper_code, sizeof(helper_code), nullptr);
+    if (!helper_addr_) {
+        LOG("FAILED_TO_ALLOCATE_HELPER_CODE");
+        return false;
+    }
+    
+    SIZE_T written;
+    if (!WriteProcessMemory(h_proc_, helper_addr_, helper_code, sizeof(helper_code), &written) || written != sizeof(helper_code)) {
+        LOG("FAILED_TO_WRITE_HELPER_CODE");
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+        return false;
+    }
 
+    // Allocate trampoline
     const size_t TRAMP_SIZE = 256;
     trampoline_ = VirtualAllocEx(h_proc_, nullptr, TRAMP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!trampoline_) return false;
+    if (!trampoline_) {
+        LOG("FAILED_TO_ALLOCATE_TRAMPOLINE");
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+        return false;
+    }
 
     std::vector<BYTE> tramp(TRAMP_SIZE, 0x90);
     memcpy(tramp.data(), orig_bytes_.data(), STOLEN_SIZE);
@@ -134,14 +153,41 @@ bool SendFunctionHook::Install() {
     DWORD ret_addr = (DWORD)target_func_ + STOLEN_SIZE;
     *(DWORD*)(tramp.data() + offset + 24) = ret_addr - (jmp_from + 5);
 
-    if (!WriteProcessMemory(h_proc_, trampoline_, tramp.data(), TRAMP_SIZE, nullptr)) return false;
+    if (!WriteProcessMemory(h_proc_, trampoline_, tramp.data(), TRAMP_SIZE, &written) || written != TRAMP_SIZE) {
+        LOG("FAILED_TO_WRITE_TRAMPOLINE");
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
 
-    // APPLY HOOK
+    // APPLY HOOK with proper page protection
     std::vector<BYTE> hook(STOLEN_SIZE, 0x90);
     hook[0] = 0xE9;
     *(DWORD*)(&hook[1]) = (DWORD)trampoline_ - ((DWORD)target_func_ + 5);
 
-    if (!WriteProcessMemory(h_proc_, target_func_, hook.data(), STOLEN_SIZE, nullptr)) return false;
+    DWORD old_protect;
+    if (!VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        LOG("FAILED_TO_CHANGE_PAGE_PROTECTION_FOR_HOOK");
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
+
+    if (!WriteProcessMemory(h_proc_, target_func_, hook.data(), STOLEN_SIZE, &written) || written != STOLEN_SIZE) {
+        LOG("FAILED_TO_WRITE_HOOK");
+        DWORD temp;
+        VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, old_protect, &temp);
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
+
+    DWORD temp;
+    VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, old_protect, &temp);
+    FlushInstructionCache(h_proc_, target_func_, STOLEN_SIZE);
 
     is_installed_ = true;
     LOG("SEND_HOOK_ACTIVE");
@@ -149,13 +195,30 @@ bool SendFunctionHook::Install() {
 }
 
 bool SendFunctionHook::Uninstall() {
-    if (!is_installed_) return true;
+    if (!is_installed_) {
+        // Nothing to uninstall
+        return true;
+    }
+    
     LOG("REMOVING_SEND_HOOK");
-    Restore();
-    if (trampoline_) VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
-    if (helper_addr_) VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
-    trampoline_ = helper_addr_ = nullptr;
+    
+    // Restore original bytes
+    if (!Restore()) {
+        LOG("WARNING: Failed to restore original bytes");
+    }
+    
+    // Free allocated memory
+    if (trampoline_) {
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        trampoline_ = nullptr;
+    }
+    if (helper_addr_) {
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+    }
+    
     is_installed_ = false;
+    LOG("SEND_HOOK_REMOVED");
     return true;
 }
 
@@ -163,26 +226,45 @@ bool SendFunctionHook::Uninstall() {
 // [ 0x03 ] RECV HOOK IMPLEMENTATION
 // =========================================================================================
 bool RecvFunctionHook::Install() {
-    if (is_installed_) return true;
+    // Always uninstall first to restore original bytes and clean up any existing hooks
+    ForceUninstall();
+    
+    // Clean up any existing hooks from previous runs (this will free old allocations)
+    CleanupExistingHook(6);
 
     LOG("INSTALLING_RECV_HOOK: 0x" << std::hex << (DWORD)target_func_);
 
-    BYTE byte;
-    if (!ReadProcessMemory(h_proc_, target_func_, &byte, 1, nullptr)) return false;
-    if (byte == 0xE9 || byte == 0xE8) {
-        LOG("TARGET_ALREADY_HOOKED");
+    const size_t STOLEN_SIZE = 6;
+    
+    // Backup original bytes (will detect and restore existing hooks if present)
+    if (!Backup(STOLEN_SIZE)) {
+        LOG("FAILED_TO_BACKUP_ORIGINAL_BYTES");
         return false;
     }
 
-    const size_t STOLEN_SIZE = 6;
-    if (!Backup(STOLEN_SIZE)) return false;
-
+    // Allocate helper code
     helper_addr_ = VirtualAllocEx(h_proc_, nullptr, sizeof(helper_code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!helper_addr_) return false;
-    WriteProcessMemory(h_proc_, helper_addr_, helper_code, sizeof(helper_code), nullptr);
+    if (!helper_addr_) {
+        LOG("FAILED_TO_ALLOCATE_HELPER_CODE");
+        return false;
+    }
+    
+    SIZE_T written;
+    if (!WriteProcessMemory(h_proc_, helper_addr_, helper_code, sizeof(helper_code), &written) || written != sizeof(helper_code)) {
+        LOG("FAILED_TO_WRITE_HELPER_CODE");
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+        return false;
+    }
 
+    // Allocate trampoline
     trampoline_ = VirtualAllocEx(h_proc_, nullptr, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!trampoline_) return false;
+    if (!trampoline_) {
+        LOG("FAILED_TO_ALLOCATE_TRAMPOLINE");
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+        return false;
+    }
 
     std::vector<BYTE> tramp(256, 0xCC);
     memcpy(tramp.data(), orig_bytes_.data(), STOLEN_SIZE);
@@ -198,11 +280,40 @@ bool RecvFunctionHook::Install() {
     DWORD ret_addr = (DWORD)target_func_ + STOLEN_SIZE;
     *(DWORD*)(tramp.data() + STOLEN_SIZE + 24) = ret_addr - (jmp_from + 5);
 
-    WriteProcessMemory(h_proc_, trampoline_, tramp.data(), 256, nullptr);
+    if (!WriteProcessMemory(h_proc_, trampoline_, tramp.data(), 256, &written) || written != 256) {
+        LOG("FAILED_TO_WRITE_TRAMPOLINE");
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
 
+    // APPLY HOOK with proper page protection
     BYTE hook[6] = { 0xE9, 0x00, 0x00, 0x00, 0x00, 0x90 };
     *(DWORD*)(hook + 1) = (DWORD)trampoline_ - ((DWORD)target_func_ + 5);
-    WriteProcessMemory(h_proc_, target_func_, hook, 6, nullptr);
+
+    DWORD old_protect;
+    if (!VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        LOG("FAILED_TO_CHANGE_PAGE_PROTECTION_FOR_HOOK");
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
+
+    if (!WriteProcessMemory(h_proc_, target_func_, hook, 6, &written) || written != 6) {
+        LOG("FAILED_TO_WRITE_HOOK");
+        DWORD temp;
+        VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, old_protect, &temp);
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        trampoline_ = helper_addr_ = nullptr;
+        return false;
+    }
+
+    DWORD temp;
+    VirtualProtectEx(h_proc_, target_func_, STOLEN_SIZE, old_protect, &temp);
+    FlushInstructionCache(h_proc_, target_func_, STOLEN_SIZE);
 
     is_installed_ = true;
     LOG("RECV_HOOK_ACTIVE");
@@ -210,13 +321,30 @@ bool RecvFunctionHook::Install() {
 }
 
 bool RecvFunctionHook::Uninstall() {
-    if (!is_installed_) return true;
+    if (!is_installed_) {
+        // Nothing to uninstall
+        return true;
+    }
+    
     LOG("REMOVING_RECV_HOOK");
-    Restore();
-    if (trampoline_) VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
-    if (helper_addr_) VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
-    trampoline_ = helper_addr_ = nullptr;
+    
+    // Restore original bytes
+    if (!Restore()) {
+        LOG("WARNING: Failed to restore original bytes");
+    }
+    
+    // Free allocated memory
+    if (trampoline_) {
+        VirtualFreeEx(h_proc_, trampoline_, 0, MEM_RELEASE);
+        trampoline_ = nullptr;
+    }
+    if (helper_addr_) {
+        VirtualFreeEx(h_proc_, helper_addr_, 0, MEM_RELEASE);
+        helper_addr_ = nullptr;
+    }
+    
     is_installed_ = false;
+    LOG("RECV_HOOK_REMOVED");
     return true;
 }
 
@@ -224,31 +352,81 @@ bool RecvFunctionHook::Uninstall() {
 // [ 0x04 ] HOOK MANAGER IMPLEMENTATION
 // =========================================================================================
 bool HookManager::InstallAllHooks(void (__stdcall *cb_s)(const BYTE*, DWORD), void (__stdcall *cb_r)(const BYTE*, DWORD)) {
-    if (!InstallSendHook(cb_s)) return false;
+    LOG("INSTALLING_ALL_HOOKS - cleaning up any existing state");
+    
+    // Always uninstall all hooks first to ensure clean state
+    // This will:
+    // 1. Stop worker thread
+    // 2. Restore original bytes
+    // 3. Free all trampolines and helper code
+    // 4. Free all ring buffers
+    UninstallAllHooks();
+    
+    // Small delay to ensure cleanup completes
+    Sleep(50);
+    
+    if (!InstallSendHook(cb_s)) {
+        LOG("FAILED_TO_INSTALL_SEND_HOOK");
+        return false;
+    }
     if (!InstallRecvHook(cb_r)) {
+        LOG("FAILED_TO_INSTALL_RECV_HOOK - cleaning up");
         UninstallSendHook();
         return false;
     }
+    
+    LOG("ALL_HOOKS_INSTALLED_SUCCESSFULLY");
     return true;
 }
 
 bool HookManager::UninstallAllHooks() {
+    LOG("UNINSTALLING_ALL_HOOKS - complete cleanup");
+    
+    // Stop worker thread first to prevent race conditions
+    active_ = false;
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+    
+    // Uninstall hooks (this will restore original bytes and free allocations)
     UninstallSendHook();
     UninstallRecvHook();
+    
+    // Ensure everything is cleaned up
+    // Reset all pointers to ensure no stale references
+    hk_send_.reset();
+    hk_recv_.reset();
+    rb_send_.reset();
+    rb_recv_.reset();
+    
+    LOG("ALL_HOOKS_UNINSTALLED - state is clean");
     return true;
 }
 
 bool HookManager::InstallSendHook(void (__stdcall *cb)(const BYTE*, DWORD)) {
     try {
+        // Clean up any existing hook first
+        if (hk_send_) {
+            hk_send_->Uninstall();
+            hk_send_.reset();
+        }
+        if (rb_send_) {
+            rb_send_.reset();
+        }
+
         rb_send_ = std::make_unique<RemoteRingBuffer>(h_proc_);
         hk_send_ = std::make_unique<SendFunctionHook>(h_proc_, (LPVOID)0x00563E00, rb_send_.get());
 
         if (!hk_send_->Install()) {
+            LOG("FAILED_TO_INSTALL_SEND_HOOK");
+            hk_send_.reset();
             rb_send_.reset();
             return false;
         }
 
         cb_send_ = cb;
+        
+        // Start worker thread if not already running
         if (!active_) {
             active_ = true;
             worker_ = std::thread([this]() {
@@ -271,47 +449,109 @@ bool HookManager::InstallSendHook(void (__stdcall *cb)(const BYTE*, DWORD)) {
         }
         return true;
     } catch (...) {
+        LOG("EXCEPTION_IN_INSTALL_SEND_HOOK");
+        if (hk_send_) hk_send_.reset();
+        if (rb_send_) rb_send_.reset();
         return false;
     }
 }
 
 bool HookManager::UninstallSendHook() {
     cb_send_ = nullptr;
-    if (hk_send_) hk_send_->Uninstall();
-    hk_send_.reset();
-    rb_send_.reset();
     
+    if (hk_send_) {
+        hk_send_->Uninstall();
+        hk_send_.reset();
+    }
+    
+    if (rb_send_) {
+        rb_send_.reset();
+    }
+    
+    // Stop worker thread if no hooks are installed
     if (!hk_send_ && !hk_recv_) {
         active_ = false;
-        if (worker_.joinable()) worker_.join();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
     }
+    
     return true;
 }
 
 bool HookManager::InstallRecvHook(void (__stdcall *cb)(const BYTE*, DWORD)) {
     try {
+        // Clean up any existing hook first
+        if (hk_recv_) {
+            hk_recv_->Uninstall();
+            hk_recv_.reset();
+        }
+        if (rb_recv_) {
+            rb_recv_.reset();
+        }
+
         rb_recv_ = std::make_unique<RemoteRingBuffer>(h_proc_);
         hk_recv_ = std::make_unique<RecvFunctionHook>(h_proc_, (LPVOID)0x00467060, rb_recv_.get()); // RECV_FUNC_ADDR
+        
         if (!hk_recv_->Install()) {
+            LOG("FAILED_TO_INSTALL_RECV_HOOK");
+            hk_recv_.reset();
             rb_recv_.reset();
             return false;
         }
+        
         cb_recv_ = cb;
+        
+        // Start worker thread if not already running
+        if (!active_) {
+            active_ = true;
+            worker_ = std::thread([this]() {
+                std::vector<BYTE> buf;
+                while (active_) {
+                    bool busy = false;
+                    if (rb_send_ && rb_send_->ReadPacket(buf)) {
+                        std::lock_guard<std::mutex> lock(cb_lock_);
+                        if (cb_send_) cb_send_(buf.data(), (DWORD)buf.size());
+                        busy = true;
+                    }
+                    if (rb_recv_ && rb_recv_->ReadPacket(buf)) {
+                        std::lock_guard<std::mutex> lock(cb_lock_);
+                        if (cb_recv_) cb_recv_(buf.data(), (DWORD)buf.size());
+                        busy = true;
+                    }
+                    if (!busy) Sleep(1);
+                }
+            });
+        }
+        
         return true;
     } catch (...) {
+        LOG("EXCEPTION_IN_INSTALL_RECV_HOOK");
+        if (hk_recv_) hk_recv_.reset();
+        if (rb_recv_) rb_recv_.reset();
         return false;
     }
 }
 
 bool HookManager::UninstallRecvHook() {
     cb_recv_ = nullptr;
-    if (hk_recv_) hk_recv_->Uninstall();
-    hk_recv_.reset();
-    rb_recv_.reset();
+    
+    if (hk_recv_) {
+        hk_recv_->Uninstall();
+        hk_recv_.reset();
+    }
+    
+    if (rb_recv_) {
+        rb_recv_.reset();
+    }
 
+    // Stop worker thread if no hooks are installed
     if (!hk_send_ && !hk_recv_) {
         active_ = false;
-        if (worker_.joinable()) worker_.join();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
     }
+    
     return true;
 }
